@@ -1,0 +1,6 @@
+{
+  "name": "RasterZone OCR — PDF to Image & Coordinate Excel Exporter",
+  "description": "Convert PDFs and scanned documents into raster images, define millimeter coordinate OCR zones or full-page extraction modes, and export structured data to Excel.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
