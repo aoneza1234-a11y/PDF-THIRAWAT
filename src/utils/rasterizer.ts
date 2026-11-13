@@ -577,6 +577,58 @@ export async function preprocessFullPageImage(
   return canvas.toDataURL('image/png');
 }
 
+/**
+ * Ensures image data URLs sent to Cloud API routes stay safely under serverless body limits (e.g. Vercel 4.5 MB).
+ */
+export async function compressImageForApi(
+  dataUrl: string,
+  maxChars = 2_600_000
+): Promise<{ dataUrl: string; mimeType: string }> {
+  const mimeMatch = dataUrl.match(/^data:([^;]+);base64,/);
+  const currentMime = mimeMatch?.[1] || 'image/png';
+  if (dataUrl.length <= maxChars) {
+    return { dataUrl, mimeType: currentMime };
+  }
+
+  const img = await loadImage(dataUrl);
+  const srcW = img.naturalWidth || img.width || 1654;
+  const srcH = img.naturalHeight || img.height || 2339;
+
+  const tryEncode = (maxEdge: number, quality: number): string => {
+    const scale = Math.min(1, maxEdge / Math.max(srcW, srcH, 1));
+    const w = Math.max(1, Math.round(srcW * scale));
+    const h = Math.max(1, Math.round(srcH * scale));
+    const canvas = document.createElement('canvas');
+    canvas.width = w;
+    canvas.height = h;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return dataUrl;
+    ctx.fillStyle = '#FFFFFF';
+    ctx.fillRect(0, 0, w, h);
+    ctx.imageSmoothingEnabled = true;
+    ctx.imageSmoothingQuality = 'high';
+    ctx.drawImage(img, 0, 0, w, h);
+    return canvas.toDataURL('image/jpeg', quality);
+  };
+
+  const attempts: Array<[number, number]> = [
+    [2200, 0.88],
+    [2000, 0.78],
+    [1800, 0.7],
+    [1500, 0.65],
+  ];
+
+  let latest = dataUrl;
+  for (const [edge, quality] of attempts) {
+    latest = tryEncode(edge, quality);
+    if (latest.length <= maxChars) {
+      return { dataUrl: latest, mimeType: 'image/jpeg' };
+    }
+  }
+
+  return { dataUrl: latest, mimeType: 'image/jpeg' };
+}
+
 type WebkitEntry = {
   isFile: boolean;
   isDirectory: boolean;

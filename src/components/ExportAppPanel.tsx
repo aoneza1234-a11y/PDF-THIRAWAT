@@ -12,6 +12,7 @@ import {
   WifiOff,
 } from 'lucide-react';
 import type { OcrZone, ZoneTemplate } from '../types/ocr';
+import { postForBlob } from '../utils/apiClient';
 import { preloadOfflineLanguagePack } from '../utils/offlineOcr';
 import { PWAInstallButton } from './PWAInstallButton';
 
@@ -48,22 +49,15 @@ export const ExportAppPanel: React.FC<ExportAppPanelProps> = ({
     setExportDoneMsg(null);
 
     try {
-      const resp = await fetch('/api/export-offline-html', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
+      const blob = await postForBlob(
+        '/api/export-offline-html',
+        {
           includeCurrentZones,
           zones: includeCurrentZones ? zones : [],
           templates: includeCurrentZones ? templates : [],
-        }),
-      });
-
-      if (!resp.ok) {
-        const data = await resp.json().catch(() => ({}));
-        throw new Error(data.error || 'ไม่สามารถสร้างไฟล์เว็บแอปออฟไลน์ได้');
-      }
-
-      const blob = await resp.blob();
+        },
+        'ไม่สามารถสร้างไฟล์เว็บแอปออฟไลน์ได้'
+      );
       const url = URL.createObjectURL(blob);
       const a = document.createElement('a');
       a.href = url;
@@ -88,22 +82,15 @@ export const ExportAppPanel: React.FC<ExportAppPanelProps> = ({
     setExportDoneMsg(null);
 
     try {
-      const resp = await fetch('/api/export-bundle', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
+      const blob = await postForBlob(
+        '/api/export-bundle',
+        {
           includeCurrentZones,
           zones: includeCurrentZones ? zones : [],
           templates: includeCurrentZones ? templates : [],
-        }),
-      });
-
-      if (!resp.ok) {
-        const data = await resp.json().catch(() => ({}));
-        throw new Error(data.error || 'ไม่สามารถสร้างไฟล์แพ็กเกจโปรแกรมได้');
-      }
-
-      const blob = await resp.blob();
+        },
+        'ไม่สามารถสร้างไฟล์แพ็กเกจโปรแกรมได้'
+      );
       const url = URL.createObjectURL(blob);
       const a = document.createElement('a');
       a.href = url;

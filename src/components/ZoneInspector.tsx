@@ -17,7 +17,8 @@ import type {
   ZoneDataType,
   ZoneTemplate,
 } from '../types/ocr';
-import { cropZoneImage } from '../utils/rasterizer';
+import { compressImageForApi, cropZoneImage } from '../utils/rasterizer';
+import { postJson } from '../utils/apiClient';
 import { runOfflineZonesOcr } from '../utils/offlineOcr';
 
 interface ZoneInspectorProps {
@@ -112,25 +113,24 @@ export const ZoneInspector: React.FC<ZoneInspectorProps> = ({
         const text = data.results?.[selectedZone.id]?.text ?? '';
         setTestResult(text || '(ไม่พบข้อความในกรอบนี้)');
       } else {
-        const resp = await fetch('/api/ocr/zones', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
+        const prepared = await compressImageForApi(croppedUrl);
+        const data = await postJson<{
+          results?: Record<string, { text: string; confidence: string }>;
+        }>(
+          '/api/ocr/zones',
+          {
             zones: [
               {
                 zoneId: selectedZone.id,
                 label: selectedZone.label,
                 dataType: selectedZone.dataType,
-                imageBase64: croppedUrl,
-                mimeType: 'image/png',
+                imageBase64: prepared.dataUrl,
+                mimeType: prepared.mimeType,
               },
             ],
-          }),
-        });
-        const data = await resp.json();
-        if (!resp.ok) {
-          throw new Error(data.error || 'ไม่สามารถอ่าน OCR ได้');
-        }
+          },
+          'ไม่สามารถอ่าน OCR ได้'
+        );
         const text = data.results?.[selectedZone.id]?.text ?? '';
         setTestResult(text || '(ไม่พบข้อความในกรอบนี้)');
       }

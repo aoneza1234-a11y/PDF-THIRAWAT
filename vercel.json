@@ -1,0 +1,18 @@
+{
+  "buildCommand": "npm run build",
+  "outputDirectory": "dist",
+  "functions": {
+    "api/export-offline-html.ts": {
+      "includeFiles": "dist-offline/**"
+    },
+    "api/export-bundle.ts": {
+      "includeFiles": "{src/**,public/**,lib/**,api/**,server.ts,index.html,package.json,tsconfig.json,vite.config.ts,vite.offline.config.ts,vercel.json,.env.example,metadata.json}"
+    }
+  },
+  "rewrites": [
+    {
+      "source": "/((?!api/|assets/|pdfjs/|sw\\.js|workbox-.*|manifest\\.webmanifest).*)",
+      "destination": "/index.html"
+    }
+  ]
+}

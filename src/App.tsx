@@ -24,12 +24,14 @@ import type {
 } from './types/ocr';
 import { exportResultsToExcel } from './utils/excelExport';
 import {
+  compressImageForApi,
   cropZoneImage,
   generateSampleCustomsDocument,
   preprocessFullPageImage,
   rasterizeFile,
   rotatePageClockwise,
 } from './utils/rasterizer';
+import { postJson } from './utils/apiClient';
 import { runOfflineFullPageOcr, runOfflineZonesOcr } from './utils/offlineOcr';
 
 const TEMPLATES_STORAGE_KEY = 'rasterzone_ocr_templates_v1';
@@ -286,7 +288,7 @@ export default function App() {
           const cellsMap: Record<string, ZoneOcrCell> = {};
 
           if (applicableZones.length > 0) {
-            const zonePayloads = await Promise.all(
+            const rawZonePayloads = await Promise.all(
               applicableZones.map(async (z) => {
                 const cropped = await cropZoneImage(page, z, preprocess);
                 return {
@@ -308,23 +310,57 @@ export default function App() {
             };
 
             if (ocrEngine === 'offline') {
-              data = await runOfflineZonesOcr(zonePayloads);
+              data = await runOfflineZonesOcr(rawZonePayloads);
             } else {
-              const resp = await fetch('/api/ocr/zones', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({
-                  zones: zonePayloads,
-                  languageHint: customHint,
-                }),
-              });
-              data = await resp.json();
-              if (!resp.ok) {
-                throw new Error(data.error || 'เกิดข้อผิดพลาดในการอ่าน OCR แบบกรอบพิกัด');
+              const zonePayloads = await Promise.all(
+                rawZonePayloads.map(async (item) => {
+                  const compressed = await compressImageForApi(item.imageBase64, 900_000);
+                  return {
+                    ...item,
+                    imageBase64: compressed.dataUrl,
+                    mimeType: compressed.mimeType,
+                  };
+                })
+              );
+
+              const mergedResults: Record<
+                string,
+                { text: string; confidence: 'high' | 'medium' | 'low' }
+              > = {};
+              const MAX_BATCH_CHARS = 2_400_000;
+              let batch: typeof zonePayloads = [];
+              let batchChars = 0;
+
+              const flushBatch = async () => {
+                if (batch.length === 0) return;
+                const respData = await postJson<{
+                  results?: Record<
+                    string,
+                    { text: string; confidence: 'high' | 'medium' | 'low' }
+                  >;
+                }>(
+                  '/api/ocr/zones',
+                  { zones: batch, languageHint: customHint },
+                  'เกิดข้อผิดพลาดในการอ่าน OCR แบบกรอบพิกัด'
+                );
+                Object.assign(mergedResults, respData.results ?? {});
+                batch = [];
+                batchChars = 0;
+              };
+
+              for (const zp of zonePayloads) {
+                const itemSize = zp.imageBase64.length + 256;
+                if (batch.length > 0 && batchChars + itemSize > MAX_BATCH_CHARS) {
+                  await flushBatch();
+                }
+                batch.push(zp);
+                batchChars += itemSize;
               }
+              await flushBatch();
+              data = { results: mergedResults };
             }
 
-            for (const payload of zonePayloads) {
+            for (const payload of rawZonePayloads) {
               const r = data.results?.[payload.zoneId];
               cellsMap[payload.zoneId] = {
                 zoneId: payload.zoneId,
@@ -379,20 +415,17 @@ export default function App() {
           if (ocrEngine === 'offline') {
             data = await runOfflineFullPageOcr(imageToScan, apiMode);
           } else {
-            const resp = await fetch('/api/ocr/full-page', {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({
-                imageBase64: imageToScan,
-                mimeType: 'image/png',
+            const prepared = await compressImageForApi(imageToScan);
+            data = await postJson(
+              '/api/ocr/full-page',
+              {
+                imageBase64: prepared.dataUrl,
+                mimeType: prepared.mimeType,
                 mode: apiMode,
                 customHint,
-              }),
-            });
-            data = await resp.json();
-            if (!resp.ok) {
-              throw new Error(data.error || 'เกิดข้อผิดพลาดในการถอดภาพทั้งหน้า');
-            }
+              },
+              'เกิดข้อผิดพลาดในการถอดภาพทั้งหน้า'
+            );
           }
 
           nextFullResults.push({
