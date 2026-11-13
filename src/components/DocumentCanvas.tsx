@@ -5,6 +5,7 @@ import {
   Maximize2,
   MousePointer2,
   Plus,
+  RotateCw,
   SquareDashedMousePointer,
   Trash2,
   ZoomIn,
@@ -23,6 +24,7 @@ interface DocumentCanvasProps {
   onAddZone: (zone: OcrZone) => void;
   onUpdateZone: (id: string, patch: Partial<OcrZone>) => void;
   onDeleteZone: (id: string) => void;
+  onRotatePage?: () => void;
 }
 
 type DragAction =
@@ -60,6 +62,7 @@ export const DocumentCanvas: React.FC<DocumentCanvasProps> = ({
   onAddZone,
   onUpdateZone,
   onDeleteZone,
+  onRotatePage,
 }) => {
   const scrollContainerRef = useRef<HTMLDivElement>(null);
   const paperRef = useRef<HTMLDivElement>(null);
@@ -300,6 +303,18 @@ export const DocumentCanvas: React.FC<DocumentCanvasProps> = ({
         </div>
 
         <div className="flex items-center gap-3">
+          {page && onRotatePage && (
+            <button
+              type="button"
+              onClick={onRotatePage}
+              className="flex items-center gap-1.5 px-2.5 py-1 rounded border border-slate-600 text-slate-200 hover:border-slate-500 hover:bg-slate-700 text-xs transition-colors whitespace-nowrap shrink-0"
+              title="หมุนภาพเอกสาร 90 องศา"
+            >
+              <RotateCw className="w-3.5 h-3.5" />
+              <span>หมุน 90°</span>
+            </button>
+          )}
+
           {cursorMm && page && (
             <div className="hidden xl:flex items-center gap-1.5 text-slate-300 font-mono-tabular">
               <Crosshair className="w-3.5 h-3.5 text-slate-400" />
@@ -355,18 +370,18 @@ export const DocumentCanvas: React.FC<DocumentCanvasProps> = ({
             </p>
           </div>
         ) : (
-          <div className="relative inline-block pb-10 pr-8">
+          <div className="relative inline-block pb-10 pr-8 pl-3">
             {/* Corner unit indicator */}
             <div
-              className="absolute top-0 left-0 w-7 h-7 bg-white border-r border-b border-slate-300 flex items-center justify-center text-[10px] font-mono-tabular font-semibold text-slate-600 z-20"
-              style={{ transform: 'translate(-28px, -28px)' }}
+              className="absolute top-0 left-0 w-9 h-7 bg-white border-r border-b border-slate-300 flex items-center justify-center text-[10px] font-mono-tabular font-semibold text-slate-600 z-20"
+              style={{ transform: 'translate(-24px, -28px)' }}
             >
               mm
             </div>
 
             {/* Top Millimeter Ruler */}
             <div
-              className="absolute left-0 bg-white border-b border-slate-300 h-7 overflow-hidden z-10 shadow-sm"
+              className="absolute left-3 bg-white border-b border-slate-300 h-7 overflow-hidden z-10 shadow-sm"
               style={{
                 width: `${displayWidth}px`,
                 top: '-28px',
@@ -381,7 +396,7 @@ export const DocumentCanvas: React.FC<DocumentCanvasProps> = ({
                     className="absolute bottom-0 border-l border-slate-400"
                     style={{
                       left: `${leftPx}px`,
-                      height: isMajor ? '12px' : '6px',
+                      height: isMajor ? '10px' : '5px',
                     }}
                   >
                     {isMajor && mm > 0 && (
@@ -396,10 +411,10 @@ export const DocumentCanvas: React.FC<DocumentCanvasProps> = ({
 
             {/* Left Millimeter Ruler */}
             <div
-              className="absolute top-0 bg-white border-r border-slate-300 w-7 overflow-hidden z-10 shadow-sm"
+              className="absolute top-0 bg-white border-r border-slate-300 w-9 overflow-hidden z-10 shadow-sm"
               style={{
                 height: `${displayHeight}px`,
-                left: '-28px',
+                left: '-24px',
               }}
             >
               {yTicksMm.map((mm) => {
@@ -411,11 +426,11 @@ export const DocumentCanvas: React.FC<DocumentCanvasProps> = ({
                     className="absolute right-0 border-t border-slate-400"
                     style={{
                       top: `${topPx}px`,
-                      width: isMajor ? '12px' : '6px',
+                      width: isMajor ? '10px' : '5px',
                     }}
                   >
                     {isMajor && mm > 0 && (
-                      <span className="absolute -left-6 -translate-y-1/2 text-[10px] font-mono-tabular font-semibold text-slate-700">
+                      <span className="absolute right-3 -translate-y-1/2 text-[10px] font-mono-tabular font-semibold text-slate-700">
                         {mm}
                       </span>
                     )}

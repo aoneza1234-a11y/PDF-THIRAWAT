@@ -18,9 +18,11 @@ import type {
   ZoneTemplate,
 } from '../types/ocr';
 import { cropZoneImage } from '../utils/rasterizer';
+import { runOfflineZonesOcr } from '../utils/offlineOcr';
 
 interface ZoneInspectorProps {
   mode: ExtractionMode;
+  ocrEngine: 'cloud' | 'offline';
   page: RenderedPage | null;
   zones: OcrZone[];
   selectedZoneId: string | null;
@@ -41,6 +43,7 @@ interface ZoneInspectorProps {
 
 export const ZoneInspector: React.FC<ZoneInspectorProps> = ({
   mode,
+  ocrEngine,
   page,
   zones,
   selectedZoneId,
@@ -96,27 +99,41 @@ export const ZoneInspector: React.FC<ZoneInspectorProps> = ({
         grayscale,
         contrastBoost,
       });
-      const resp = await fetch('/api/ocr/zones', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          zones: [
-            {
-              zoneId: selectedZone.id,
-              label: selectedZone.label,
-              dataType: selectedZone.dataType,
-              imageBase64: croppedUrl,
-              mimeType: 'image/png',
-            },
-          ],
-        }),
-      });
-      const data = await resp.json();
-      if (!resp.ok) {
-        throw new Error(data.error || 'ไม่สามารถอ่าน OCR ได้');
+
+      if (ocrEngine === 'offline') {
+        const data = await runOfflineZonesOcr([
+          {
+            zoneId: selectedZone.id,
+            label: selectedZone.label,
+            dataType: selectedZone.dataType,
+            imageBase64: croppedUrl,
+          },
+        ]);
+        const text = data.results?.[selectedZone.id]?.text ?? '';
+        setTestResult(text || '(ไม่พบข้อความในกรอบนี้)');
+      } else {
+        const resp = await fetch('/api/ocr/zones', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            zones: [
+              {
+                zoneId: selectedZone.id,
+                label: selectedZone.label,
+                dataType: selectedZone.dataType,
+                imageBase64: croppedUrl,
+                mimeType: 'image/png',
+              },
+            ],
+          }),
+        });
+        const data = await resp.json();
+        if (!resp.ok) {
+          throw new Error(data.error || 'ไม่สามารถอ่าน OCR ได้');
+        }
+        const text = data.results?.[selectedZone.id]?.text ?? '';
+        setTestResult(text || '(ไม่พบข้อความในกรอบนี้)');
       }
-      const text = data.results?.[selectedZone.id]?.text ?? '';
-      setTestResult(text || '(ไม่พบข้อความในกรอบนี้)');
     } catch (err: unknown) {
       setTestError(err instanceof Error ? err.message : 'เกิดข้อผิดพลาด');
     } finally {

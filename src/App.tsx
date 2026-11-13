@@ -9,6 +9,7 @@ import {
 import { DocumentCanvas } from './components/DocumentCanvas';
 import { ExportAppPanel } from './components/ExportAppPanel';
 import { FileQueueSidebar } from './components/FileQueueSidebar';
+import { OfflineIndicator } from './components/OfflineIndicator';
 import { ResultsPanel } from './components/ResultsPanel';
 import { ZoneInspector } from './components/ZoneInspector';
 import type {
@@ -27,13 +28,33 @@ import {
   generateSampleCustomsDocument,
   preprocessFullPageImage,
   rasterizeFile,
+  rotatePageClockwise,
 } from './utils/rasterizer';
+import { runOfflineFullPageOcr, runOfflineZonesOcr } from './utils/offlineOcr';
 
 const TEMPLATES_STORAGE_KEY = 'rasterzone_ocr_templates_v1';
 
+interface StandaloneWindow extends Window {
+  __RASTERZONE_OFFLINE_STANDALONE__?: boolean;
+  __RASTERZONE_DEFAULT_PRESET__?: {
+    zones?: OcrZone[];
+    templates?: ZoneTemplate[];
+  } | null;
+}
+
 export default function App() {
+  const isStandaloneOffline =
+    typeof window !== 'undefined' &&
+    (window.location.protocol === 'file:' ||
+      Boolean((window as StandaloneWindow).__RASTERZONE_OFFLINE_STANDALONE__));
+
   const [activeTab, setActiveTab] = useState<'workspace' | 'results' | 'export'>('workspace');
   const [mode, setMode] = useState<ExtractionMode>('zones');
+  const [ocrEngine, setOcrEngine] = useState<'cloud' | 'offline'>(() =>
+    isStandaloneOffline || (typeof navigator !== 'undefined' && !navigator.onLine)
+      ? 'offline'
+      : 'cloud'
+  );
   const [documents, setDocuments] = useState<DocumentItem[]>([]);
   const [activeDocId, setActiveDocId] = useState<string | null>(null);
   const [activePageNumber, setActivePageNumber] = useState<number>(1);
@@ -91,22 +112,38 @@ export default function App() {
       // Ignore localStorage restrictions
     }
 
-    // Load friend-shared preset if bundled in /default-preset.json
-    fetch('/default-preset.json')
-      .then((res) => (res.ok ? res.json() : null))
-      .then((preset) => {
-        if (!preset) return;
-        if (Array.isArray(preset.zones) && preset.zones.length > 0) {
-          setZones(preset.zones);
-          setSelectedZoneId(preset.zones[0]?.id ?? null);
-        }
-        if (!hasSavedTemplates && Array.isArray(preset.templates) && preset.templates.length > 0) {
-          setTemplates(preset.templates);
-        }
-      })
-      .catch(() => {
-        // Optional file; ignore when absent
-      });
+    // 1. Check inline embedded preset injected into standalone offline .html
+    const inlinePreset =
+      typeof window !== 'undefined'
+        ? (window as StandaloneWindow).__RASTERZONE_DEFAULT_PRESET__
+        : null;
+    if (inlinePreset && Array.isArray(inlinePreset.zones) && inlinePreset.zones.length > 0) {
+      setZones(inlinePreset.zones);
+      setSelectedZoneId(inlinePreset.zones[0]?.id ?? null);
+      if (!hasSavedTemplates && Array.isArray(inlinePreset.templates) && inlinePreset.templates.length > 0) {
+        setTemplates(inlinePreset.templates);
+      }
+      return;
+    }
+
+    // 2. Load friend-shared preset if bundled in /default-preset.json (HTTP server mode)
+    if (window.location.protocol !== 'file:') {
+      fetch('/default-preset.json')
+        .then((res) => (res.ok ? res.json() : null))
+        .then((preset) => {
+          if (!preset) return;
+          if (Array.isArray(preset.zones) && preset.zones.length > 0) {
+            setZones(preset.zones);
+            setSelectedZoneId(preset.zones[0]?.id ?? null);
+          }
+          if (!hasSavedTemplates && Array.isArray(preset.templates) && preset.templates.length > 0) {
+            setTemplates(preset.templates);
+          }
+        })
+        .catch(() => {
+          // Optional file; ignore when absent
+        });
+    }
   }, []);
 
   const persistTemplates = (next: ZoneTemplate[]) => {
@@ -130,35 +167,56 @@ export default function App() {
     if (items.length === 0) return;
     setRasterizing(true);
     setOcrError(null);
+    const failedFiles: string[] = [];
     try {
       const nextDocs: DocumentItem[] = [];
       for (const item of items) {
-        const doc = await rasterizeFile(
-          item.file,
-          item.relativePath,
-          preprocess.dpi
-        );
-        nextDocs.push(doc);
+        try {
+          const doc = await rasterizeFile(
+            item.file,
+            item.relativePath,
+            preprocess.dpi
+          );
+          nextDocs.push(doc);
+        } catch (fileErr: unknown) {
+          const msg = fileErr instanceof Error ? fileErr.message : 'อ่านไฟล์ไม่ได้';
+          failedFiles.push(`${item.file.name} (${msg})`);
+        }
       }
 
-      setDocuments((prev) => {
-        // If only the auto-loaded sample is present, replace it cleanly when user drops real files
-        const hasOnlySample =
-          prev.length === 1 && prev[0].id.startsWith('sample_');
-        return hasOnlySample ? nextDocs : [...prev, ...nextDocs];
-      });
-
       if (nextDocs.length > 0) {
+        setDocuments((prev) => {
+          const hasOnlySample =
+            prev.length === 1 && prev[0].id.startsWith('sample_');
+          return hasOnlySample ? nextDocs : [...prev, ...nextDocs];
+        });
         setActiveDocId(nextDocs[0].id);
         setActivePageNumber(1);
       }
-    } catch (err: unknown) {
-      setOcrError(
-        err instanceof Error ? err.message : 'ไม่สามารถแปลงไฟล์ PDF เป็นภาพได้'
-      );
+
+      if (failedFiles.length > 0) {
+        setOcrError(`มีบางไฟล์ไม่สามารถแปลงภาพได้: ${failedFiles.join(', ')}`);
+      }
     } finally {
       setRasterizing(false);
     }
+  };
+
+  const handleRotateActivePage = async () => {
+    if (!activeDoc || !activePage) return;
+    const rotated = await rotatePageClockwise(activePage);
+    setDocuments((prev) =>
+      prev.map((d) =>
+        d.id === activeDoc.id
+          ? {
+              ...d,
+              pages: d.pages.map((p) =>
+                p.pageNumber === activePage.pageNumber ? rotated : p
+              ),
+            }
+          : d
+      )
+    );
   };
 
   const handleLoadSample = () => {
@@ -241,17 +299,29 @@ export default function App() {
               })
             );
 
-            const resp = await fetch('/api/ocr/zones', {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({
-                zones: zonePayloads,
-                languageHint: customHint,
-              }),
-            });
-            const data = await resp.json();
-            if (!resp.ok) {
-              throw new Error(data.error || 'เกิดข้อผิดพลาดในการอ่าน OCR แบบกรอบพิกัด');
+            let data: {
+              results?: Record<
+                string,
+                { text: string; confidence: 'high' | 'medium' | 'low' }
+              >;
+              error?: string;
+            };
+
+            if (ocrEngine === 'offline') {
+              data = await runOfflineZonesOcr(zonePayloads);
+            } else {
+              const resp = await fetch('/api/ocr/zones', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                  zones: zonePayloads,
+                  languageHint: customHint,
+                }),
+              });
+              data = await resp.json();
+              if (!resp.ok) {
+                throw new Error(data.error || 'เกิดข้อผิดพลาดในการอ่าน OCR แบบกรอบพิกัด');
+              }
             }
 
             for (const payload of zonePayloads) {
@@ -278,7 +348,7 @@ export default function App() {
 
         if (mode === 'full-table' || mode === 'full-lines' || mode === 'hybrid') {
           let imageToScan = '';
-          let apiMode: 'full-table' | 'full-lines' | 'hybrid-table' =
+          const apiMode: 'full-table' | 'full-lines' | 'hybrid-table' =
             mode === 'full-lines'
               ? 'full-lines'
               : mode === 'hybrid'
@@ -298,19 +368,31 @@ export default function App() {
             imageToScan = await preprocessFullPageImage(page, preprocess);
           }
 
-          const resp = await fetch('/api/ocr/full-page', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              imageBase64: imageToScan,
-              mimeType: 'image/png',
-              mode: apiMode,
-              customHint,
-            }),
-          });
-          const data = await resp.json();
-          if (!resp.ok) {
-            throw new Error(data.error || 'เกิดข้อผิดพลาดในการถอดภาพทั้งหน้า');
+          let data: {
+            documentTitle?: string;
+            keyValues?: Array<{ key: string; value: string }>;
+            tables?: Array<{ tableName: string; headers: string[]; rows: string[][] }>;
+            lines?: Array<{ lineNo: number; cells: string[] }>;
+            error?: string;
+          };
+
+          if (ocrEngine === 'offline') {
+            data = await runOfflineFullPageOcr(imageToScan, apiMode);
+          } else {
+            const resp = await fetch('/api/ocr/full-page', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                imageBase64: imageToScan,
+                mimeType: 'image/png',
+                mode: apiMode,
+                customHint,
+              }),
+            });
+            data = await resp.json();
+            if (!resp.ok) {
+              throw new Error(data.error || 'เกิดข้อผิดพลาดในการถอดภาพทั้งหน้า');
+            }
           }
 
           nextFullResults.push({
@@ -414,7 +496,7 @@ export default function App() {
                 : 'border-transparent text-slate-500 hover:text-slate-900'
             }`}
           >
-            ส่งออกโปรแกรม (.zip)
+            ส่งออกเว็บแอปออฟไลน์
           </button>
         </nav>
 
@@ -473,7 +555,34 @@ export default function App() {
           </div>
         </div>
 
-        <div className="flex items-center gap-3">
+        <div className="flex items-center gap-2.5 flex-wrap">
+          {!isStandaloneOffline && (
+            <div className="flex items-center bg-slate-100 p-0.5 rounded-md border border-slate-200 text-xs">
+              <button
+                type="button"
+                onClick={() => setOcrEngine('cloud')}
+                className={`px-2.5 py-1 rounded font-medium transition-colors whitespace-nowrap shrink-0 ${
+                  ocrEngine === 'cloud'
+                    ? 'bg-white text-slate-900 shadow-sm'
+                    : 'text-slate-600 hover:text-slate-900'
+                }`}
+              >
+                Cloud AI
+              </button>
+              <button
+                type="button"
+                onClick={() => setOcrEngine('offline')}
+                className={`px-2.5 py-1 rounded font-medium transition-colors whitespace-nowrap shrink-0 ${
+                  ocrEngine === 'offline'
+                    ? 'bg-white text-slate-900 shadow-sm'
+                    : 'text-slate-600 hover:text-slate-900'
+                }`}
+              >
+                Offline ในเครื่อง
+              </button>
+            </div>
+          )}
+
           <select
             value={scanScope}
             onChange={(e) => setScanScope(e.target.value as 'current' | 'all')}
@@ -563,11 +672,13 @@ export default function App() {
                 setZones((prev) => prev.filter((z) => z.id !== id));
                 if (selectedZoneId === id) setSelectedZoneId(null);
               }}
+              onRotatePage={handleRotateActivePage}
             />
           </main>
 
           <ZoneInspector
             mode={mode}
+            ocrEngine={ocrEngine}
             page={activePage}
             zones={zones}
             selectedZoneId={selectedZoneId}
@@ -672,6 +783,7 @@ export default function App() {
           }}
         />
       )}
+      <OfflineIndicator />
     </div>
   );
 }

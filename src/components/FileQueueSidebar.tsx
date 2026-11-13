@@ -127,10 +127,10 @@ export const FileQueueSidebar: React.FC<FileQueueSidebarProps> = ({
               <>
                 <UploadCloud className="w-6 h-6 text-slate-400 mx-auto mb-1.5" />
                 <p className="text-xs font-semibold text-slate-800">
-                  ลากวางไฟล์ PDF / รูปภาพ / โฟลเดอร์
+                  ลากวางไฟล์ PDF / รูปภาพสแกน / โฟลเดอร์
                 </p>
                 <p className="text-[11px] text-slate-500 mt-0.5">
-                  แปลงทุกหน้าเป็นภาพ (Raster) เพื่ออ่าน OCR
+                  รองรับ PDF, PNG, JPG, WebP, TIFF (.tif)
                 </p>
               </>
             )}
@@ -140,7 +140,7 @@ export const FileQueueSidebar: React.FC<FileQueueSidebarProps> = ({
             ref={fileInputRef}
             type="file"
             multiple
-            accept=".pdf,image/*"
+            accept=".pdf,.png,.jpg,.jpeg,.webp,.bmp,.gif,.tif,.tiff,.jfif,.avif,image/*,application/pdf"
             onChange={handleFileInput}
             className="hidden"
           />

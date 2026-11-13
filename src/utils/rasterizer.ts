@@ -1,15 +1,37 @@
 import * as pdfjsLib from 'pdfjs-dist';
-import pdfWorkerUrl from 'pdfjs-dist/build/pdf.worker.min.mjs?url';
+import pdfWorkerCode from 'pdfjs-dist/build/pdf.worker.min.mjs?raw';
+import UTIF from 'utif';
 import type { DocumentItem, OcrZone, RenderedPage } from '../types/ocr';
 
-pdfjsLib.GlobalWorkerOptions.workerSrc = pdfWorkerUrl;
+const pdfWorkerBlob = new Blob([pdfWorkerCode], { type: 'application/javascript' });
+pdfjsLib.GlobalWorkerOptions.workerSrc = URL.createObjectURL(pdfWorkerBlob);
+
+const MAX_CANVAS_EDGE_PX = 3200;
 
 function loadImage(src: string): Promise<HTMLImageElement> {
   return new Promise((resolve, reject) => {
     const img = new Image();
-    img.onload = () => resolve(img);
-    img.onerror = () => reject(new Error('ไม่สามารถโหลดภาพได้'));
+    img.onload = async () => {
+      try {
+        if (typeof img.decode === 'function') {
+          await img.decode();
+        }
+      } catch {
+        // Proceed even if decode() is unsupported on specific formats
+      }
+      resolve(img);
+    };
+    img.onerror = () => reject(new Error('ไม่สามารถโหลดไฟล์ภาพได้'));
     img.src = src;
+  });
+}
+
+function readFileAsDataUrl(file: File): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(String(reader.result || ''));
+    reader.onerror = () => reject(new Error('ไม่สามารถอ่านไฟล์ภาพได้'));
+    reader.readAsDataURL(file);
   });
 }
 
@@ -17,32 +39,208 @@ function createId(prefix: string): string {
   return `${prefix}_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
 }
 
+function computeClampedDimensions(w: number, h: number): { width: number; height: number } {
+  const maxDim = Math.max(w, h);
+  if (maxDim <= MAX_CANVAS_EDGE_PX) {
+    return { width: Math.max(1, Math.round(w)), height: Math.max(1, Math.round(h)) };
+  }
+  const ratio = MAX_CANVAS_EDGE_PX / maxDim;
+  return {
+    width: Math.max(1, Math.round(w * ratio)),
+    height: Math.max(1, Math.round(h * ratio)),
+  };
+}
+
+function isCanvasBlank(ctx: CanvasRenderingContext2D, width: number, height: number): boolean {
+  try {
+    const stepX = Math.max(1, Math.floor(width / 32));
+    const stepY = Math.max(1, Math.floor(height / 32));
+    const data = ctx.getImageData(0, 0, width, height).data;
+    for (let y = 0; y < height; y += stepY) {
+      for (let x = 0; x < width; x += stepX) {
+        const idx = (y * width + x) * 4;
+        const r = data[idx];
+        const g = data[idx + 1];
+        const b = data[idx + 2];
+        const a = data[idx + 3];
+        if (a > 0 && (r < 248 || g < 248 || b < 248)) {
+          return false;
+        }
+      }
+    }
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+interface PdfImageLike {
+  width?: number;
+  height?: number;
+  data?: Uint8ClampedArray | Uint8Array;
+  kind?: number;
+  bitmap?: ImageBitmap;
+}
+
+async function tryDrawEmbeddedPdfImages(
+  page: pdfjsLib.PDFPageProxy,
+  canvas: HTMLCanvasElement,
+  ctx: CanvasRenderingContext2D
+): Promise<boolean> {
+  try {
+    const opList = await page.getOperatorList();
+    const imageNames: string[] = [];
+    for (let i = 0; i < opList.fnArray.length; i++) {
+      const fn = opList.fnArray[i];
+      if (
+        fn === pdfjsLib.OPS.paintImageXObject ||
+        fn === pdfjsLib.OPS.paintImageXObjectRepeat
+      ) {
+        const name = opList.argsArray[i]?.[0];
+        if (typeof name === 'string') imageNames.push(name);
+      }
+    }
+
+    for (const imgName of imageNames) {
+      const imgObj = await new Promise<PdfImageLike | null>((resolve) => {
+        try {
+          if (page.objs.has(imgName)) {
+            resolve(page.objs.get(imgName) as PdfImageLike);
+            return;
+          }
+          page.objs.get(imgName, (obj: unknown) => resolve((obj as PdfImageLike) ?? null));
+        } catch {
+          resolve(null);
+        }
+      });
+
+      if (!imgObj) continue;
+
+      if (imgObj.bitmap) {
+        ctx.fillStyle = '#FFFFFF';
+        ctx.fillRect(0, 0, canvas.width, canvas.height);
+        ctx.drawImage(imgObj.bitmap, 0, 0, canvas.width, canvas.height);
+        return !isCanvasBlank(ctx, canvas.width, canvas.height);
+      }
+
+      if (imgObj.width && imgObj.height && imgObj.data) {
+        const tmp = document.createElement('canvas');
+        tmp.width = imgObj.width;
+        tmp.height = imgObj.height;
+        const tctx = tmp.getContext('2d');
+        if (!tctx) continue;
+
+        const imgData = tctx.createImageData(imgObj.width, imgObj.height);
+        const src = imgObj.data;
+        const dst = imgData.data;
+        const pixelCount = imgObj.width * imgObj.height;
+
+        if (src.length === pixelCount * 4) {
+          dst.set(src);
+        } else if (src.length === pixelCount * 3) {
+          for (let p = 0, s = 0, d = 0; p < pixelCount; p++, s += 3, d += 4) {
+            dst[d] = src[s];
+            dst[d + 1] = src[s + 1];
+            dst[d + 2] = src[s + 2];
+            dst[d + 3] = 255;
+          }
+        } else if (src.length === pixelCount) {
+          for (let p = 0, d = 0; p < pixelCount; p++, d += 4) {
+            const v = src[p];
+            dst[d] = v;
+            dst[d + 1] = v;
+            dst[d + 2] = v;
+            dst[d + 3] = 255;
+          }
+        } else {
+          continue;
+        }
+
+        tctx.putImageData(imgData, 0, 0);
+        ctx.fillStyle = '#FFFFFF';
+        ctx.fillRect(0, 0, canvas.width, canvas.height);
+        ctx.drawImage(tmp, 0, 0, canvas.width, canvas.height);
+        if (!isCanvasBlank(ctx, canvas.width, canvas.height)) {
+          return true;
+        }
+      }
+    }
+  } catch {
+    // Ignore fallback error
+  }
+  return false;
+}
+
 export async function rasterizeFile(
   file: File,
   relativePath: string,
   dpi: 150 | 200 | 300
 ): Promise<DocumentItem> {
-  const isPdf =
-    file.type === 'application/pdf' || file.name.toLowerCase().endsWith('.pdf');
+  const lowerName = file.name.toLowerCase();
+  const isPdf = file.type === 'application/pdf' || lowerName.endsWith('.pdf');
+  const isTiff =
+    file.type === 'image/tiff' ||
+    lowerName.endsWith('.tif') ||
+    lowerName.endsWith('.tiff');
 
   if (isPdf) {
-    const arrayBuffer = await file.arrayBuffer();
-    const loadingTask = pdfjsLib.getDocument({ data: arrayBuffer });
-    const pdf = await loadingTask.promise;
+    const rawBuffer = await file.arrayBuffer();
+    const isFileProtocol =
+      typeof window !== 'undefined' && window.location.protocol === 'file:';
+    const origin =
+      typeof window !== 'undefined' && window.location.origin !== 'null'
+        ? window.location.origin
+        : '';
+
+    const assetUrls =
+      !isFileProtocol && origin
+        ? {
+            cMapUrl: `${origin}/pdfjs/cmaps/`,
+            cMapPacked: true,
+            iccUrl: `${origin}/pdfjs/iccs/`,
+            standardFontDataUrl: `${origin}/pdfjs/standard_fonts/`,
+            wasmUrl: `${origin}/pdfjs/wasm/`,
+          }
+        : {};
+
+    const loadPdf = (useWasm: boolean) =>
+      pdfjsLib.getDocument({
+        data: rawBuffer.slice(0),
+        useWasm,
+        useWorkerFetch: false,
+        isOffscreenCanvasSupported: false,
+        isImageDecoderSupported: false,
+        ...assetUrls,
+      }).promise;
+
+    const pdf = await loadPdf(true);
+    let fallbackPdf: pdfjsLib.PDFDocumentProxy | null = null;
     const pages: RenderedPage[] = [];
-    const scale = dpi / 72;
+    const desiredScale = dpi / 72;
 
     for (let pageNum = 1; pageNum <= pdf.numPages; pageNum++) {
       const page = await pdf.getPage(pageNum);
       const baseViewport = page.getViewport({ scale: 1 });
-      const widthMm = Number(((baseViewport.width * 25.4) / 72).toFixed(1));
-      const heightMm = Number(((baseViewport.height * 25.4) / 72).toFixed(1));
 
-      const viewport = page.getViewport({ scale });
+      // Normalize physical mm if a scanner stored pixel coordinates as PDF points
+      let widthMm = Number(((baseViewport.width * 25.4) / 72).toFixed(1));
+      let heightMm = Number(((baseViewport.height * 25.4) / 72).toFixed(1));
+      if (widthMm > 600 || heightMm > 850) {
+        const aspect = baseViewport.height / Math.max(1, baseViewport.width);
+        widthMm = 210;
+        heightMm = Number((210 * aspect).toFixed(1));
+      }
+
+      // Clamp scale so giant scanner PDFs never exceed browser Canvas limits (which causes blank white output)
+      const maxBaseEdge = Math.max(baseViewport.width, baseViewport.height, 1);
+      const maxAllowedScale = MAX_CANVAS_EDGE_PX / maxBaseEdge;
+      const safeScale = Math.min(desiredScale, maxAllowedScale);
+
+      const viewport = page.getViewport({ scale: safeScale });
       const canvas = document.createElement('canvas');
-      canvas.width = Math.round(viewport.width);
-      canvas.height = Math.round(viewport.height);
-      const ctx = canvas.getContext('2d');
+      canvas.width = Math.max(1, Math.round(viewport.width));
+      canvas.height = Math.max(1, Math.round(viewport.height));
+      const ctx = canvas.getContext('2d', { willReadFrequently: true });
       if (!ctx) throw new Error('Canvas 2D context unavailable');
 
       ctx.fillStyle = '#FFFFFF';
@@ -53,6 +251,49 @@ export async function rasterizeFile(
         viewport,
         canvas,
       }).promise;
+
+      // Rescue blank scanned PDF pages (e.g. failed WASM JBIG2/JPX, print intent, or embedded image XObjects)
+      if (isCanvasBlank(ctx, canvas.width, canvas.height)) {
+        const retryViewport = page.getViewport({
+          scale: Math.min(safeScale, 1.5),
+        });
+        canvas.width = Math.max(1, Math.round(retryViewport.width));
+        canvas.height = Math.max(1, Math.round(retryViewport.height));
+        ctx.fillStyle = '#FFFFFF';
+        ctx.fillRect(0, 0, canvas.width, canvas.height);
+        await page.render({
+          canvasContext: ctx,
+          viewport: retryViewport,
+          canvas,
+          intent: 'print',
+        }).promise;
+
+        if (isCanvasBlank(ctx, canvas.width, canvas.height)) {
+          // Pure-JS no-WASM fallback for scanned PDFs when WASM fails
+          try {
+            if (!fallbackPdf) {
+              fallbackPdf = await loadPdf(false);
+            }
+            const fbPage = await fallbackPdf.getPage(pageNum);
+            const fbViewport = fbPage.getViewport({ scale: Math.min(safeScale, 1.8) });
+            canvas.width = Math.max(1, Math.round(fbViewport.width));
+            canvas.height = Math.max(1, Math.round(fbViewport.height));
+            ctx.fillStyle = '#FFFFFF';
+            ctx.fillRect(0, 0, canvas.width, canvas.height);
+            await fbPage.render({
+              canvasContext: ctx,
+              viewport: fbViewport,
+              canvas,
+            }).promise;
+          } catch {
+            // Proceed to embedded XObject fallback below
+          }
+        }
+
+        if (isCanvasBlank(ctx, canvas.width, canvas.height)) {
+          await tryDrawEmbeddedPdfImages(page, canvas, ctx);
+        }
+      }
 
       pages.push({
         pageNumber: pageNum,
@@ -76,22 +317,52 @@ export async function rasterizeFile(
     };
   }
 
-  // Image file path (PNG, JPG, WebP, BMP, etc.)
-  const objectUrl = URL.createObjectURL(file);
-  try {
-    const img = await loadImage(objectUrl);
-    const canvas = document.createElement('canvas');
-    canvas.width = img.naturalWidth || img.width;
-    canvas.height = img.naturalHeight || img.height;
-    const ctx = canvas.getContext('2d');
-    if (!ctx) throw new Error('Canvas 2D context unavailable');
-    ctx.fillStyle = '#FFFFFF';
-    ctx.fillRect(0, 0, canvas.width, canvas.height);
-    ctx.drawImage(img, 0, 0);
+  // Multi-page or single-page TIFF scanner file support
+  if (isTiff) {
+    const buffer = await file.arrayBuffer();
+    const ifds = UTIF.decode(buffer);
+    if (!ifds || ifds.length === 0) {
+      throw new Error('ไม่สามารถอ่านไฟล์ TIFF ที่สแกนมาได้');
+    }
 
-    // Map image width proportionally assuming standard A4 width (210mm) when high-res, or pixel-to-mm
-    const widthMm = 210;
-    const heightMm = Number(((canvas.height / canvas.width) * widthMm).toFixed(1));
+    const pages: RenderedPage[] = [];
+    for (let i = 0; i < ifds.length; i++) {
+      const ifd = ifds[i];
+      UTIF.decodeImage(buffer, ifd);
+      const rgba = UTIF.toRGBA8(ifd);
+      const srcW = ifd.width;
+      const srcH = ifd.height;
+
+      const srcCanvas = document.createElement('canvas');
+      srcCanvas.width = srcW;
+      srcCanvas.height = srcH;
+      const sctx = srcCanvas.getContext('2d');
+      if (!sctx) throw new Error('Canvas 2D context unavailable');
+      const imgData = sctx.createImageData(srcW, srcH);
+      imgData.data.set(rgba);
+      sctx.putImageData(imgData, 0, 0);
+
+      const { width, height } = computeClampedDimensions(srcW, srcH);
+      const outCanvas = document.createElement('canvas');
+      outCanvas.width = width;
+      outCanvas.height = height;
+      const octx = outCanvas.getContext('2d');
+      if (!octx) throw new Error('Canvas 2D context unavailable');
+      octx.fillStyle = '#FFFFFF';
+      octx.fillRect(0, 0, width, height);
+      octx.drawImage(srcCanvas, 0, 0, width, height);
+
+      const widthMm = 210;
+      const heightMm = Number(((height / width) * widthMm).toFixed(1));
+      pages.push({
+        pageNumber: i + 1,
+        widthPx: width,
+        heightPx: height,
+        widthMm,
+        heightMm,
+        dataUrl: outCanvas.toDataURL('image/png'),
+      });
+    }
 
     return {
       id: createId('doc'),
@@ -100,21 +371,128 @@ export async function rasterizeFile(
       sourceType: 'image',
       fileSize: file.size,
       dpi,
-      pages: [
-        {
-          pageNumber: 1,
-          widthPx: canvas.width,
-          heightPx: canvas.height,
-          widthMm,
-          heightMm,
-          dataUrl: canvas.toDataURL('image/png'),
-        },
-      ],
+      pages,
       status: 'ready',
     };
-  } finally {
-    URL.revokeObjectURL(objectUrl);
   }
+
+  // Standard Scanned Image file path (PNG, JPG, WebP, BMP, JFIF, AVIF, etc.)
+  let bitmap: ImageBitmap | null = null;
+  if (typeof createImageBitmap === 'function') {
+    try {
+      bitmap = await createImageBitmap(file, { imageOrientation: 'from-image' });
+    } catch {
+      bitmap = null;
+    }
+  }
+
+  if (bitmap) {
+    try {
+      const { width, height } = computeClampedDimensions(bitmap.width, bitmap.height);
+      const canvas = document.createElement('canvas');
+      canvas.width = width;
+      canvas.height = height;
+      const ctx = canvas.getContext('2d');
+      if (!ctx) throw new Error('Canvas 2D context unavailable');
+      ctx.fillStyle = '#FFFFFF';
+      ctx.fillRect(0, 0, width, height);
+      ctx.drawImage(bitmap, 0, 0, width, height);
+
+      const widthMm = 210;
+      const heightMm = Number(((height / width) * widthMm).toFixed(1));
+      const dataUrl = canvas.toDataURL('image/png');
+
+      return {
+        id: createId('doc'),
+        name: file.name,
+        relativePath: relativePath || file.name,
+        sourceType: 'image',
+        fileSize: file.size,
+        dpi,
+        pages: [
+          {
+            pageNumber: 1,
+            widthPx: width,
+            heightPx: height,
+            widthMm,
+            heightMm,
+            dataUrl,
+          },
+        ],
+        status: 'ready',
+      };
+    } finally {
+      bitmap.close();
+    }
+  }
+
+  // Fallback path using FileReader + Image.decode()
+  const rawDataUrl = await readFileAsDataUrl(file);
+  const img = await loadImage(rawDataUrl);
+  const srcW = img.naturalWidth || img.width || 1654;
+  const srcH = img.naturalHeight || img.height || 2339;
+  const { width, height } = computeClampedDimensions(srcW, srcH);
+
+  const canvas = document.createElement('canvas');
+  canvas.width = width;
+  canvas.height = height;
+  const ctx = canvas.getContext('2d');
+  if (!ctx) throw new Error('Canvas 2D context unavailable');
+  ctx.fillStyle = '#FFFFFF';
+  ctx.fillRect(0, 0, width, height);
+  ctx.drawImage(img, 0, 0, width, height);
+
+  let finalDataUrl = canvas.toDataURL('image/png');
+  if (!finalDataUrl || finalDataUrl === 'data:,') {
+    finalDataUrl = rawDataUrl;
+  }
+
+  const widthMm = 210;
+  const heightMm = Number(((height / width) * widthMm).toFixed(1));
+
+  return {
+    id: createId('doc'),
+    name: file.name,
+    relativePath: relativePath || file.name,
+    sourceType: 'image',
+    fileSize: file.size,
+    dpi,
+    pages: [
+      {
+        pageNumber: 1,
+        widthPx: width,
+        heightPx: height,
+        widthMm,
+        heightMm,
+        dataUrl: finalDataUrl,
+      },
+    ],
+    status: 'ready',
+  };
+}
+
+export async function rotatePageClockwise(page: RenderedPage): Promise<RenderedPage> {
+  const img = await loadImage(page.dataUrl);
+  const canvas = document.createElement('canvas');
+  canvas.width = page.heightPx;
+  canvas.height = page.widthPx;
+  const ctx = canvas.getContext('2d');
+  if (!ctx) throw new Error('Canvas 2D context unavailable');
+
+  ctx.fillStyle = '#FFFFFF';
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+  ctx.translate(canvas.width / 2, canvas.height / 2);
+  ctx.rotate(Math.PI / 2);
+  ctx.drawImage(img, -page.widthPx / 2, -page.heightPx / 2);
+
+  return {
+    ...page,
+    widthPx: page.heightPx,
+    heightPx: page.widthPx,
+    widthMm: page.heightMm,
+    heightMm: page.widthMm,
+    dataUrl: canvas.toDataURL('image/png'),
+  };
 }
 
 function applyImageFilters(
@@ -247,7 +625,7 @@ export function isSupportedDocumentFile(file: File): boolean {
     file.type === 'application/pdf' ||
     lower.endsWith('.pdf') ||
     file.type.startsWith('image/') ||
-    /\.(png|jpe?g|webp|bmp|gif)$/i.test(lower)
+    /\.(png|jpe?g|webp|bmp|gif|tif|tiff|jfif|avif)$/i.test(lower)
   );
 }
 
@@ -300,11 +678,6 @@ export function generateSampleCustomsDocument(): {
   ctx.fillRect(0, 0, W, H);
 
   const mmToPx = (mm: number) => (mm / 210) * W;
-
-  // Outer form frame
-  const left = mmToPx(12);
-  const top = mmToPx(14);
-  const formW = mmToPx(186);
 
   ctx.strokeStyle = '#CBD5E1';
   ctx.lineWidth = 2;
@@ -429,7 +802,7 @@ export function generateSampleCustomsDocument(): {
   drawLabel('รายการสินค้า (LINE ITEMS DETAIL)', 12, 177);
 
   const tableTop = 181;
-  const colWidths = [14, 34, 62, 24, 24, 28]; // Sum = 186mm
+  const colWidths = [14, 34, 62, 24, 24, 28];
   const headers = ['ลำดับ', 'พิกัดศุลกากร', 'รายละเอียดสินค้า', 'จำนวน', 'น้ำหนัก (KG)', 'มูลค่า (USD)'];
   const rowsData = [
     ['0001', '8708.29.99', 'FRONT BUMPER ASSEMBLY - RANGER T6', '120 PCS', '3,840.00', '48,600.00'],
@@ -438,7 +811,6 @@ export function generateSampleCustomsDocument(): {
     ['0004', '8708.30.29', 'DISC BRAKE CALIPER KIT (HEAVY DUTY)', '160 PCS', '2,750.00', '31,300.00'],
   ];
 
-  // Header fill
   ctx.fillStyle = '#EFF6FF';
   ctx.fillRect(mmToPx(12), mmToPx(tableTop), mmToPx(186), mmToPx(11));
 
@@ -463,15 +835,9 @@ export function generateSampleCustomsDocument(): {
     }
   }
 
-  // Footer stamp note
   ctx.fillStyle = '#64748B';
   ctx.font = '18px "Noto Sans Thai", sans-serif';
   ctx.fillText('เอกสารตัวอย่างสำหรับทดสอบการถอดภาพ OCR (Rasterized Image Sample - No Embedded Text)', mmToPx(12), mmToPx(265));
-
-  // Keep unused variable quiet
-  void left;
-  void top;
-  void formW;
 
   const dataUrl = canvas.toDataURL('image/png');
   const docId = createId('sample');

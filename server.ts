@@ -3,9 +3,13 @@ import type { Request, Response } from "express";
 import dotenv from "dotenv";
 import path from "path";
 import fs from "fs/promises";
+import { execFile } from "child_process";
+import { promisify } from "util";
 import { fileURLToPath } from "url";
 import { GoogleGenAI, Type, ThinkingLevel } from "@google/genai";
 import JSZip from "jszip";
+
+const execFileAsync = promisify(execFile);
 
 dotenv.config();
 
@@ -357,7 +361,7 @@ app.post("/api/ocr/full-page", async (req: Request, res: Response) => {
   }
 });
 
-const EXCLUDED_DIRS = new Set(["node_modules", ".git", ".aistudio"]);
+const EXCLUDED_DIRS = new Set(["node_modules", ".git", ".aistudio", "dist-offline"]);
 const EXCLUDED_FILES = new Set([".env", ".env.local", ".env.production", ".DS_Store"]);
 
 async function addDirectoryToZip(
@@ -543,6 +547,62 @@ app.post("/api/export-bundle", async (req: Request, res: Response) => {
   } catch (err: unknown) {
     const message = err instanceof Error ? err.message : "ไม่สามารถส่งออกชุดโปรแกรมได้";
     console.error("Export bundle error:", err);
+    res.status(500).json({ error: message });
+  }
+});
+
+app.post("/api/export-offline-html", async (req: Request, res: Response) => {
+  try {
+    const body = req.body as {
+      includeCurrentZones?: boolean;
+      zones?: unknown[];
+      templates?: unknown[];
+    };
+
+    const offlineHtmlPath = path.join(__dirname, "dist-offline", "index.html");
+    let exists = false;
+    try {
+      await fs.access(offlineHtmlPath);
+      exists = true;
+    } catch {
+      exists = false;
+    }
+
+    if (!exists) {
+      await execFileAsync(
+        "npx",
+        ["vite", "build", "--config", "vite.offline.config.ts"],
+        { cwd: __dirname }
+      );
+    }
+
+    let html = await fs.readFile(offlineHtmlPath, "utf-8");
+
+    const presetData =
+      body?.includeCurrentZones && Array.isArray(body.zones)
+        ? {
+            zones: body.zones,
+            templates: Array.isArray(body.templates) ? body.templates : [],
+            exportedAt: new Date().toISOString(),
+          }
+        : null;
+
+    const safeJson = JSON.stringify(presetData).replace(/<\/script/gi, "<\\/script");
+    const bootstrapScript = `<script>
+window.__RASTERZONE_OFFLINE_STANDALONE__ = true;
+window.__RASTERZONE_DEFAULT_PRESET__ = ${safeJson};
+</script>`;
+
+    html = html.replace("</head>", `${bootstrapScript}\n</head>`);
+
+    const filename = `RasterZone-OCR-Offline-${new Date().toISOString().slice(0, 10)}.html`;
+    res.setHeader("Content-Type", "text/html; charset=utf-8");
+    res.setHeader("Content-Disposition", `attachment; filename="${filename}"`);
+    res.send(html);
+  } catch (err: unknown) {
+    const message =
+      err instanceof Error ? err.message : "ไม่สามารถสร้างเว็บแอปออฟไลน์ได้";
+    console.error("Export offline HTML error:", err);
     res.status(500).json({ error: message });
   }
 });
